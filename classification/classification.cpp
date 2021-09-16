@@ -48,14 +48,12 @@
 #include "opencv2/opencv.hpp"
 #include "opencv2/core.hpp"
 #include "opencv2/imgproc.hpp"
-#include "opencv2/highgui.hpp"
-#include "opencv2/videoio.hpp"
 
 #define MAX_CLASSES 1100
+#define TOP_CANDIDATES 3
 
 int current_eop = 0;
 int num_eops = 0;
-int top_candidates = 3;
 int size = 0;
 int selected_items_size;
 int * selected_items;
@@ -71,8 +69,6 @@ void AllocateMemory(const std::vector<tidl::ExecutionObjectPipeline*>& eops);
 bool ProcessFrame(tidl::ExecutionObjectPipeline* eop, cv::Mat &src);
 void DisplayFrame(const tidl::ExecutionObjectPipeline* eop, cv::Mat& dst);
 int tf_postprocess(uchar *in);
-bool tf_expected_id(int id);
-void populate_labels(const char* filename);
 
 // exports for the filter
 extern "C" {
@@ -81,8 +77,6 @@ extern "C" {
     void filter_free(void* filter_ctx);
 }
 
-bool verbose = false;
-
 /**
     Initializes the filter. If you return something, it will be passed to the
     filter_process function, and should be freed by the filter_free function
@@ -90,7 +84,14 @@ bool verbose = false;
 bool filter_init(const char* args, void** filter_ctx) {
     std::cout << "Initializing filter" << std::endl;
 
-    populate_labels("/usr/share/ti/examples/tidl/classification/imagenet.txt");
+    std::ifstream file("/usr/share/ti/examples/tidl/classification/imagenet.txt");
+    if (file.is_open()) {
+        std::string inputLine;
+        while (getline(file, inputLine)) { // while the end of file is NOT reached
+            labels_classes[size++] = new std::string(inputLine);
+        }
+        file.close();
+    }
 
     selected_items_size = 10;
     selected_items = (int *)malloc(selected_items_size*sizeof(int));
@@ -111,13 +112,13 @@ bool filter_init(const char* args, void** filter_ctx) {
 
     std::cout << "loading configuration" << std::endl;
     configuration.numFrames = 0;
-    configuration.inData = 
+    configuration.inData =
         "/usr/share/ti/examples/tidl/test/testvecs/input/preproc_0_224x224.y";
-    configuration.outData = 
+    configuration.outData =
         "/usr/share/ti/examples/tidl/classification/stats_tool_out.bin";
-    configuration.netBinFile = 
+    configuration.netBinFile =
         "/usr/share/ti/examples/tidl/test/testvecs/config/tidl_models/tidl_net_imagenet_jacintonet11v2.bin";
-    configuration.paramsBinFile = 
+    configuration.paramsBinFile =
         "/usr/share/ti/examples/tidl/test/testvecs/config/tidl_models/tidl_param_imagenet_jacintonet11v2.bin";
     configuration.preProcType = 0;
     configuration.inWidth = 224;
@@ -166,13 +167,13 @@ void filter_process(void* filter_ctx, cv::Mat& src, cv::Mat& dst) {
         tidl::ExecutionObjectPipeline* eop = eops[current_eop];
 
         // Wait for previous frame on the same eo to finish processing
-        if(eop->ProcessFrameWait()) doDisplay = 1;
+        if (eop->ProcessFrameWait()) doDisplay = 1;
 
         ProcessFrame(eop, src);
-        if(doDisplay) DisplayFrame(eop, dst);
+        if (doDisplay) DisplayFrame(eop, dst);
 
         current_eop++;
-        if(current_eop >= num_eops)
+        if (current_eop >= num_eops)
             current_eop = 0;
     }
     catch (tidl::Exception &e)
@@ -251,7 +252,7 @@ void AllocateMemory(const std::vector<tidl::ExecutionObjectPipeline*>& eops)
         void*  in_ptr   = malloc(in_size);
         void*  out_ptr  = malloc(out_size);
         assert(in_ptr != nullptr && out_ptr != nullptr);
-        
+
         tidl::ArgInfo in(in_ptr,   in_size);
         tidl::ArgInfo out(out_ptr, out_size);
         eop->SetInputOutputBuffer(in, out);
@@ -261,21 +262,21 @@ void AllocateMemory(const std::vector<tidl::ExecutionObjectPipeline*>& eops)
 
 bool ProcessFrame(tidl::ExecutionObjectPipeline* eop, cv::Mat &src)
 {
-    if(configuration.enableApiTrace)
+    if (configuration.enableApiTrace)
         std::cout << "preprocess()" << std::endl;
-    tidl::imgutil::PreprocessImage(src, 
+    tidl::imgutil::PreprocessImage(src,
                              eop->GetInputBufferPtr(), configuration);
     eop->ProcessFrameStartAsync();
-        
+
     return false;
 }
 
 void DisplayFrame(const tidl::ExecutionObjectPipeline* eop, cv::Mat& dst)
 {
-    if(configuration.enableApiTrace)
+    if (configuration.enableApiTrace)
         std::cout << "postprocess()" << std::endl;
     int is_object = tf_postprocess((uchar*) eop->GetOutputBufferPtr());
-    if(is_object >= 0)
+    if (is_object >= 0)
     {
         cv::putText(
             dst,
@@ -285,11 +286,10 @@ void DisplayFrame(const tidl::ExecutionObjectPipeline* eop, cv::Mat& dst)
             1.5,
             cv::Scalar(0,255,0),
             3,  /* thickness */
-            8
-        );
+            8);
     }
-    if(last_rpt_id != is_object) {
-        if(is_object >= 0)
+    if (last_rpt_id != is_object) {
+        if (is_object >= 0)
         {
             std::cout << "(" << is_object << ")="
                       << (*(labels_classes[is_object])).c_str() << std::endl;
@@ -298,21 +298,10 @@ void DisplayFrame(const tidl::ExecutionObjectPipeline* eop, cv::Mat& dst)
     }
 }
 
-// Function to filter all the reported decisions
-bool tf_expected_id(int id)
-{
-   // Filter out unexpected IDs
-   for (int i = 0; i < selected_items_size; i ++)
-   {
-       if(id == selected_items[i]) return true;
-   }
-   return false;
-}
 
 int tf_postprocess(uchar *in)
 {
-    // sort and get k largest values and corresponding indices
-    const int k = top_candidates;
+    // sort and get largest values and corresponding indices
     int rpt_id = -1;
 
     typedef std::pair<uchar, int> val_index;
@@ -320,15 +309,15 @@ int tf_postprocess(uchar *in)
     std::priority_queue<val_index, std::vector<val_index>, decltype(cmp)> queue(cmp);
 
     // initialize priority queue with smallest value on top
-    for (int i = 0; i < k; i++) {
-        if(configuration.enableApiTrace)
+    for (int i = 0; i < TOP_CANDIDATES; i++) {
+        if (configuration.enableApiTrace)
             std::cout << "push(" << i << "):"
                 << in[i] << std::endl;
         queue.push(val_index(in[i], i));
     }
 
     // for rest input, if larger than current minimum, pop mininum, push new val
-    for (int i = k; i < size; i++)
+    for (int i = TOP_CANDIDATES; i < size; i++)
     {
         if (in[i] > queue.top().first)
         {
@@ -337,7 +326,7 @@ int tf_postprocess(uchar *in)
         }
     }
 
-    // output top k values in reverse order: largest val first
+    // output top values in reverse order: largest val first
     std::vector<val_index> sorted;
     while (! queue.empty())
     {
@@ -345,29 +334,18 @@ int tf_postprocess(uchar *in)
         queue.pop();
     }
 
-    for (int i = 0; i < k; i++)
+    for (int i = 0; i < TOP_CANDIDATES; i++)
     {
         int id = sorted[i].second;
 
-        if (tf_expected_id(id))
+        // Filter out unexpected IDs
+        for (int j = 0; j < selected_items_size; j++)
         {
-            rpt_id = id;
+            if (id == selected_items[j]) {
+                rpt_id = id;
+                break;
+            }
         }
     }
     return rpt_id;
-}
-
-void populate_labels(const char* filename)
-{
-    std::ifstream file(filename);
-    if(file.is_open())
-    {
-        std::string inputLine;
-
-        while (getline(file, inputLine)) //while the end of file is NOT reached
-        {
-            labels_classes[size++] = new std::string(inputLine);
-        }
-        file.close();
-    }
 }
