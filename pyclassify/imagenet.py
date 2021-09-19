@@ -32,6 +32,7 @@
 
 import os
 import sys
+import time
 import argparse
 import json
 import heapq
@@ -44,9 +45,16 @@ import tidl
 
 def main():
     """Read the configuration and run the network"""
-    #logging.basicConfig(level=logging.INFO)
 
-    args = parse_args()
+    parser = argparse.ArgumentParser(description='Run the imagenet network on input image.')
+    parser.add_argument('input_file', nargs="+", type=str, help='input image file (that OpenCV can read)')
+    parser.add_argument("-p", "--pipeline-depth", type=int, default=2, help="pipeline depth (default: 2)")
+    parser.add_argument("-e", "--num-eve", type=int, default=1, help="number of EVEs to use")
+    parser.add_argument("-d", "--num-dsp", type=int, default=0, help="number of DSPs to use")
+    parser.add_argument("-v", "--verbose", action="store_true", help="verbose output")
+    args = parser.parse_args()
+    if args.verbose:
+        logging.basicConfig(level=logging.INFO)
 
     config_file = "imagenet.conf"
     labels_file = 'imagenet_objects.json'
@@ -54,50 +62,31 @@ def main():
     configuration = tidl.Configuration()
     configuration.read_from_file(config_file)
 
-    if os.path.isfile(args.input_file):
-        configuration.in_data = args.input_file
-    else:
-        print('Input image {} does not exist'.format(args.input_file))
-        return
-    print('Input: {}'.format(args.input_file))
-
     num_eve = tidl.Executor.get_num_devices(tidl.DeviceType.EVE)
     num_dsp = tidl.Executor.get_num_devices(tidl.DeviceType.DSP)
-
+    if args.num_eve < 0 or args.num_eve > num_eve:
+        raise ValueError(f"Must use between 0 and {num_eve:d} EVEs")
+    if args.num_dsp < 0 or args.num_dsp > num_dsp:
+        raise ValueError(f"Must use between 0 and {num_dsp:d} DSPs")
     if num_eve == 0 and num_dsp == 0:
-        print('No TIDL API capable devices available')
-        return
+        raise RuntimeError('No TIDL API capable devices available')
 
     # use 1 EVE or DSP since input is a single image
     # If input is a stream of images, feel free to use all EVEs and/or DSPs
-    if num_eve > 0:
-        num_eve = 1
-        num_dsp = 0
-    else:
-        num_dsp = 1
+#    if num_eve > 0:
+#        num_eve = 1
+#        num_dsp = 0
+#    else:
+#        num_dsp = 1
 
-    run(num_eve, num_dsp, configuration, labels_file)
+    run(args.input_file, args.num_eve, args.num_dsp, configuration, labels_file, args.pipeline_depth)
 
     return
 
 
-DESCRIPTION = 'Run the imagenet network on input image.'
-DEFAULT_INFILE = 'cat-pet-animal-domestic-104827.jpeg'
 
-def parse_args():
-    """Parse input arguments"""
 
-    parser = argparse.ArgumentParser(description=DESCRIPTION)
-    parser.add_argument('-i', '--input_file',
-                        default=DEFAULT_INFILE,
-                        help='input image file (that OpenCV can read)')
-    args = parser.parse_args()
-
-    return args
-
-PIPELINE_DEPTH = 2
-
-def run(num_eve, num_dsp, configuration, labels_file):
+def run(input_files, num_eve, num_dsp, configuration, labels_file, pipeline_depth=2):
     """ Run the network on the specified device type and number of devices"""
 
     logging.info('Running network across {} EVEs, {} DSPs'.format(num_eve,
@@ -112,57 +101,70 @@ def run(num_eve, num_dsp, configuration, labels_file):
     configuration.param_heap_size = (3 << 20)
     configuration.network_heap_size = (20 << 20)
 
+    logging.info('TIDL API: performing one time initialization ...')
+    time0 = time.time()
 
-    try:
-        logging.info('TIDL API: performing one time initialization ...')
+    # Collect all EOs from EVE and DSP executors
+    eos = []
 
-        # Collect all EOs from EVE and DSP executors
-        eos = []
+    if eve_device_ids:
+        eve = tidl.Executor(tidl.DeviceType.EVE, eve_device_ids, configuration, 1)
+        for i in range(eve.get_num_execution_objects()):
+            eos.append(eve.at(i))
 
-        if eve_device_ids:
-            eve = tidl.Executor(tidl.DeviceType.EVE, eve_device_ids, configuration, 1)
-            for i in range(eve.get_num_execution_objects()):
-                eos.append(eve.at(i))
+    if dsp_device_ids:
+        dsp = tidl.Executor(tidl.DeviceType.DSP, dsp_device_ids, configuration, 1)
+        for i in range(dsp.get_num_execution_objects()):
+            eos.append(dsp.at(i))
+    num_eos = len(eos)
 
-        if dsp_device_ids:
-            dsp = tidl.Executor(tidl.DeviceType.DSP, dsp_device_ids, configuration, 1)
-            for i in range(dsp.get_num_execution_objects()):
-                eos.append(dsp.at(i))
+    eops = []
+    for j in range(pipeline_depth):
+        for i in range(num_eos):
+            eops.append(tidl.ExecutionObjectPipeline([eos[i]]))
+    tidl.allocate_memory(eops)
+    num_eops = len(eops)
+    logging.info("One-time initialization took {:.4f} seconds".format(time.time() - time0))
 
-        eops = []
-        num_eos = len(eos)
-        for j in range(PIPELINE_DEPTH):
-            for i in range(num_eos):
-                eops.append(tidl.ExecutionObjectPipeline([eos[i]]))
+    # open labels file
+    with open(labels_file) as json_file:
+        labels_data = json.load(json_file)
 
-        tidl.allocate_memory(eops)
+    configuration.num_frames = len(input_files)
+    logging.info(f'TIDL API: processing {configuration.num_frames} input frames ...')
 
-        # open labels file
-        with open(labels_file) as json_file:
-            labels_data = json.load(json_file)
+    time0 = time.time()
+    for frame_index in range(configuration.num_frames + num_eops):
+        # assign each frame to an EOP
+        eop = eops[frame_index % num_eops]
 
-        configuration.num_frames = 1
-        logging.info('TIDL API: processing {} input frames ...'.format(
-                                                     configuration.num_frames))
+        # once an EOP becomes available, process its output
+        if eop.process_frame_wait():
+            print("Input: {}".format(input_files[eop.get_frame_index()]))
+            for oidx, output in enumerate(process_output(eop, labels_data)):
+                print('{}: {},   prob = {:5.2f}%'.format(
+                    oidx+1, output[0], output[1]))
 
-        num_eops = len(eops)
-        for frame_index in range(configuration.num_frames+num_eops):
-            eop = eops[frame_index % num_eops]
+        # read the next frame and enqueue its processing
+        if frame_index < configuration.num_frames:
+            configuration.in_data = input_files[frame_index]
+        else:
+            continue
 
-            if eop.process_frame_wait():
-                process_output(eop, labels_data)
+        if read_frame(eop, frame_index, configuration):
+            eop.process_frame_start_async()
 
-            if read_frame(eop, frame_index, configuration):
-                eop.process_frame_start_async()
-
-        tidl.free_memory(eops)
-
-    except tidl.TidlError as err:
-        print(err)
+    timef = time.time() - time0
+    print("Processed {:d} frames in {:.4f} seconds ({:.1f} fps)".format(
+        configuration.num_frames,
+        timef,
+        configuration.num_frames / timef))
+    tidl.free_memory(eops)
 
 def read_frame(eo, frame_index, configuration):
     """Read a frame into the ExecutionObject input buffer"""
 
+    # this seems sloppy
     if frame_index >= configuration.num_frames:
         return False
 
@@ -186,6 +188,7 @@ def process_output(eo, labels_data):
 
     # keep top k predictions in heap
     k = 5
+
     # output predictions with probability of 10/255 or higher
     threshold = 10
 
@@ -204,13 +207,13 @@ def process_output(eo, labels_data):
     for i in range(k):
         k_sorted.insert(0, heapq.heappop(k_heap))
 
+    results = []
     for i in range(k):
         if k_sorted[i][0] > threshold:
-            print('{}: {},   prob = {:5.2f}%'.format(i+1, \
-                             labels_data['objects'][k_sorted[i][1]]['label'], \
-                             k_sorted[i][0]/255.0*100))
-
-    return 0
+            results.append((
+                labels_data['objects'][k_sorted[i][1]]['label'],
+                k_sorted[i][0]/255.0*100))
+    return results
 
 if __name__ == '__main__':
     main()
