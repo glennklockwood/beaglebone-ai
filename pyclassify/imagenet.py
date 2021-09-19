@@ -31,6 +31,7 @@
 """
 
 import os
+import sys
 import argparse
 import json
 import heapq
@@ -38,10 +39,8 @@ import logging
 import numpy as np
 import cv2
 
-from tidl import DeviceId, DeviceType, Configuration, TidlError
-from tidl import Executor, ExecutionObjectPipeline
-from tidl import allocate_memory, free_memory
-
+sys.path.append("/usr/share/ti/tidl/tidl_api")
+import tidl
 
 def main():
     """Read the configuration and run the network"""
@@ -49,10 +48,10 @@ def main():
 
     args = parse_args()
 
-    config_file = '../test/testvecs/config/infer/tidl_config_j11_v2.txt'
-    labels_file = '../imagenet/imagenet_objects.json'
+    config_file = "imagenet.conf"
+    labels_file = 'imagenet_objects.json'
 
-    configuration = Configuration()
+    configuration = tidl.Configuration()
     configuration.read_from_file(config_file)
 
     if os.path.isfile(args.input_file):
@@ -62,8 +61,8 @@ def main():
         return
     print('Input: {}'.format(args.input_file))
 
-    num_eve = Executor.get_num_devices(DeviceType.EVE)
-    num_dsp = Executor.get_num_devices(DeviceType.DSP)
+    num_eve = tidl.Executor.get_num_devices(tidl.DeviceType.EVE)
+    num_dsp = tidl.Executor.get_num_devices(tidl.DeviceType.DSP)
 
     if num_eve == 0 and num_dsp == 0:
         print('No TIDL API capable devices available')
@@ -83,7 +82,7 @@ def main():
 
 
 DESCRIPTION = 'Run the imagenet network on input image.'
-DEFAULT_INFILE = '../test/testvecs/input/objects/cat-pet-animal-domestic-104827.jpeg'
+DEFAULT_INFILE = 'cat-pet-animal-domestic-104827.jpeg'
 
 def parse_args():
     """Parse input arguments"""
@@ -104,10 +103,10 @@ def run(num_eve, num_dsp, configuration, labels_file):
     logging.info('Running network across {} EVEs, {} DSPs'.format(num_eve,
                                                                   num_dsp))
 
-    dsp_device_ids = set([DeviceId.ID0, DeviceId.ID1,
-                          DeviceId.ID2, DeviceId.ID3][0:num_dsp])
-    eve_device_ids = set([DeviceId.ID0, DeviceId.ID1,
-                          DeviceId.ID2, DeviceId.ID3][0:num_eve])
+    dsp_device_ids = set([tidl.DeviceId.ID0, tidl.DeviceId.ID1,
+                          tidl.DeviceId.ID2, tidl.DeviceId.ID3][0:num_dsp])
+    eve_device_ids = set([tidl.DeviceId.ID0, tidl.DeviceId.ID1,
+                          tidl.DeviceId.ID2, tidl.DeviceId.ID3][0:num_eve])
 
     # Heap sizes for this network determined using Configuration.showHeapStats
     configuration.param_heap_size = (3 << 20)
@@ -121,12 +120,12 @@ def run(num_eve, num_dsp, configuration, labels_file):
         eos = []
 
         if eve_device_ids:
-            eve = Executor(DeviceType.EVE, eve_device_ids, configuration, 1)
+            eve = tidl.Executor(tidl.DeviceType.EVE, eve_device_ids, configuration, 1)
             for i in range(eve.get_num_execution_objects()):
                 eos.append(eve.at(i))
 
         if dsp_device_ids:
-            dsp = Executor(DeviceType.DSP, dsp_device_ids, configuration, 1)
+            dsp = tidl.Executor(tidl.DeviceType.DSP, dsp_device_ids, configuration, 1)
             for i in range(dsp.get_num_execution_objects()):
                 eos.append(dsp.at(i))
 
@@ -134,9 +133,9 @@ def run(num_eve, num_dsp, configuration, labels_file):
         num_eos = len(eos)
         for j in range(PIPELINE_DEPTH):
             for i in range(num_eos):
-                eops.append(ExecutionObjectPipeline([eos[i]]))
+                eops.append(tidl.ExecutionObjectPipeline([eos[i]]))
 
-        allocate_memory(eops)
+        tidl.allocate_memory(eops)
 
         # open labels file
         with open(labels_file) as json_file:
@@ -156,9 +155,9 @@ def run(num_eve, num_dsp, configuration, labels_file):
             if read_frame(eop, frame_index, configuration):
                 eop.process_frame_start_async()
 
-        free_memory(eops)
+        tidl.free_memory(eops)
 
-    except TidlError as err:
+    except tidl.TidlError as err:
         print(err)
 
 def read_frame(eo, frame_index, configuration):
