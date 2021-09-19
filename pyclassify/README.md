@@ -26,6 +26,8 @@ This is still a work in progress.  See <https://www.glennklockwood.com/embedded/
 - `download_datasets.sh` - Copy required example input and model+parameters into
   this directory.  They aren't stored in this git repository because they're
   big, binary, and don't change.
+- `classify_url.sh` - Pass a URL to an image and this script will download and
+  identify it using `imagenet.py`
 
 [BeagleBone AI TIDL demo]: https://github.com/glennklockwood/beaglebone-ai/blob/main/classification/classification.cpp
 
