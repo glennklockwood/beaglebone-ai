@@ -119,9 +119,12 @@ def run(input_files, num_eve, num_dsp, configuration, labels_file, pipeline_dept
     num_eos = len(eos)
 
     eops = []
+    eop_map = []
     for j in range(pipeline_depth):
         for i in range(num_eos):
             eops.append(tidl.ExecutionObjectPipeline([eos[i]]))
+            eop_map.append(eos[i])
+
     tidl.allocate_memory(eops)
     num_eops = len(eops)
     logging.info("One-time initialization took {:.4f} seconds".format(time.time() - time0))
@@ -144,6 +147,9 @@ def run(input_files, num_eve, num_dsp, configuration, labels_file, pipeline_dept
             for oidx, output in enumerate(process_output(eop, labels_data)):
                 print('{}: {},   prob = {:5.2f}%'.format(
                     oidx+1, output[0], output[1]))
+            logging.info("Took {:.1f} ms on {}".format(
+                eop_map[frame_index % num_eops].get_process_time_in_ms(),
+                eop.get_device_name()))
 
         # read the next frame and enqueue its processing
         if frame_index < configuration.num_frames:
@@ -152,6 +158,7 @@ def run(input_files, num_eve, num_dsp, configuration, labels_file, pipeline_dept
             continue
 
         if read_frame(eop, frame_index, configuration):
+            print("Launching {} on {}".format(configuration.in_data, eop.get_device_name()))
             eop.process_frame_start_async()
 
     timef = time.time() - time0
