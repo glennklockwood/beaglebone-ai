@@ -43,6 +43,12 @@ import cv2
 sys.path.append("/usr/share/ti/tidl/tidl_api")
 import tidl
 
+# MUST make sure EVE and DSP Executor objects are not garbage collected as
+# they fall out of scope - even though Python doesn't reference them, the TIDL
+# runtime will transparently reference them which will trigger mystery
+# segfaults if Python destroys them
+EXECUTORS = {}
+
 def main():
     """Read the configuration and run the network"""
 
@@ -62,35 +68,28 @@ def main():
     configuration = tidl.Configuration()
     configuration.read_from_file(config_file)
 
-    num_eve = tidl.Executor.get_num_devices(tidl.DeviceType.EVE)
-    num_dsp = tidl.Executor.get_num_devices(tidl.DeviceType.DSP)
-    if args.num_eve < 0 or args.num_eve > num_eve:
-        raise ValueError(f"Must use between 0 and {num_eve:d} EVEs")
-    if args.num_dsp < 0 or args.num_dsp > num_dsp:
-        raise ValueError(f"Must use between 0 and {num_dsp:d} DSPs")
-    if num_eve == 0 and num_dsp == 0:
-        raise RuntimeError('No TIDL API capable devices available')
-
-    # use 1 EVE or DSP since input is a single image
-    # If input is a stream of images, feel free to use all EVEs and/or DSPs
-#    if num_eve > 0:
-#        num_eve = 1
-#        num_dsp = 0
-#    else:
-#        num_dsp = 1
-
-    run(args.input_file, args.num_eve, args.num_dsp, configuration, labels_file, args.pipeline_depth)
+    run(input_files=args.input_file,
+        num_eve=args.num_eve,
+        num_dsp=args.num_dsp,
+        configuration=configuration,
+        labels_file=labels_file,
+        pipeline_depth=args.pipeline_depth)
 
     return
 
+def init_tidl(configuration, num_eve, num_dsp, pipeline_depth):
+    global EXECUTORS
+    tot_eve = tidl.Executor.get_num_devices(tidl.DeviceType.EVE)
+    tot_dsp = tidl.Executor.get_num_devices(tidl.DeviceType.DSP)
+    if num_eve < 0 or num_eve > tot_eve:
+        raise ValueError(f"Must use between 0 and {tot_eve:d} EVEs")
+    if num_dsp < 0 or num_dsp > tot_dsp:
+        raise ValueError(f"Must use between 0 and {tot_dsp:d} DSPs")
+    if tot_eve == 0 and tot_dsp == 0:
+        raise RuntimeError('No TIDL API capable devices available')
 
-
-
-def run(input_files, num_eve, num_dsp, configuration, labels_file, pipeline_depth=2):
-    """ Run the network on the specified device type and number of devices"""
-
-    logging.info('Running network across {} EVEs, {} DSPs'.format(num_eve,
-                                                                  num_dsp))
+    logging.info(
+        'Running network across {} EVEs, {} DSPs'.format(num_eve, num_dsp))
 
     dsp_device_ids = set([tidl.DeviceId.ID0, tidl.DeviceId.ID1,
                           tidl.DeviceId.ID2, tidl.DeviceId.ID3][0:num_dsp])
@@ -102,32 +101,69 @@ def run(input_files, num_eve, num_dsp, configuration, labels_file, pipeline_dept
     configuration.network_heap_size = (20 << 20)
 
     logging.info('TIDL API: performing one time initialization ...')
+
     time0 = time.time()
 
     # Collect all EOs from EVE and DSP executors
     eos = []
-
     if eve_device_ids:
-        eve = tidl.Executor(tidl.DeviceType.EVE, eve_device_ids, configuration, 1)
-        for i in range(eve.get_num_execution_objects()):
-            eos.append(eve.at(i))
+        EXECUTORS['eve'] = tidl.Executor(tidl.DeviceType.EVE, eve_device_ids, configuration, 1)
+        for i in range(EXECUTORS['eve'].get_num_execution_objects()):
+            eos.append(EXECUTORS['eve'].at(i))
 
     if dsp_device_ids:
-        dsp = tidl.Executor(tidl.DeviceType.DSP, dsp_device_ids, configuration, 1)
-        for i in range(dsp.get_num_execution_objects()):
-            eos.append(dsp.at(i))
-    num_eos = len(eos)
+        EXECUTORS['dsp'] = tidl.Executor(tidl.DeviceType.DSP, dsp_device_ids, configuration, 1)
+        for i in range(EXECUTORS['dsp'].get_num_execution_objects()):
+            eos.append(EXECUTORS['dsp'].at(i))
 
+    # initialize ExecutionObjectPipelines
     eops = []
-    eop_map = []
     for j in range(pipeline_depth):
-        for i in range(num_eos):
-            eops.append(tidl.ExecutionObjectPipeline([eos[i]]))
-            eop_map.append(eos[i])
+        for i, eo in enumerate(eos):
+            eops.append(tidl.ExecutionObjectPipeline([eo]))
 
     tidl.allocate_memory(eops)
-    num_eops = len(eops)
     logging.info("One-time initialization took {:.4f} seconds".format(time.time() - time0))
+
+    return eops
+
+def device_name_to_eo(device_name):
+    """Translates device name to an ExecutionObject.
+    
+    Receives the string output from ExecutionObjectPipeline.get_device_name(),
+    finds the ExecutionObject with the same name, and returns it.  Expects only
+    device_names of the form EVE# or DSP#.
+
+    Args:
+        device_name (str): EVE0, EVE1, EVE2, EVE3, DSP0, or DSP1.
+
+    Returns:
+        tidl.ExecutionObject or None.
+    """
+    device_type = device_name[0:3].lower()
+    executor = EXECUTORS.get(device_type)
+    if not executor:
+        raise RuntimeError("Executors not yet initialized")
+
+    for i in range(executor.get_num_execution_objects()):
+        this_eo = executor.at(i)
+        this_device = this_eo.get_device_name()
+        if this_device.lower() == device_name.lower():
+            return this_eo 
+
+    return None
+
+
+def run(input_files, num_eve, num_dsp, configuration, labels_file, pipeline_depth=2):
+    """ Run the network on the specified device type and number of devices"""
+
+    # initialize TIDL, devices, etc
+    eops = init_tidl(
+        configuration=configuration,
+        num_eve=num_eve,
+        num_dsp=num_dsp,
+        pipeline_depth=pipeline_depth)
+    num_eops = len(eops)
 
     # open labels file
     with open(labels_file) as json_file:
@@ -147,9 +183,13 @@ def run(input_files, num_eve, num_dsp, configuration, labels_file, pipeline_dept
             for oidx, output in enumerate(process_output(eop, labels_data)):
                 print('{}: {},   prob = {:5.2f}%'.format(
                     oidx+1, output[0], output[1]))
+            # there's no obvious way to get the EOs that are a part of an EOP, but only EOs
+            # can get_process_time_in_ms(), so we would need to track the EOP->EO
+            # relationship
+            device_name = eop.get_device_name()
             logging.info("Took {:.1f} ms on {}".format(
-                eop_map[frame_index % num_eops].get_process_time_in_ms(),
-                eop.get_device_name()))
+                device_name_to_eo(device_name).get_process_time_in_ms(),
+                device_name))
 
         # read the next frame and enqueue its processing
         if frame_index < configuration.num_frames:
@@ -168,7 +208,7 @@ def run(input_files, num_eve, num_dsp, configuration, labels_file, pipeline_dept
         configuration.num_frames / timef))
     tidl.free_memory(eops)
 
-def read_frame(eo, frame_index, configuration):
+def read_frame(eop, frame_index, configuration):
     """Read a frame into the ExecutionObject input buffer"""
 
     # this seems sloppy
@@ -176,7 +216,7 @@ def read_frame(eo, frame_index, configuration):
         return False
 
     # Read into the EO's input buffer
-    arg_info = eo.get_input_buffer()
+    arg_info = eop.get_input_buffer()
     np_arg = np.asarray(arg_info)
 
     if configuration.in_data.startswith("/dev/"):
@@ -190,11 +230,11 @@ def read_frame(eo, frame_index, configuration):
     np_arg[1*224*224:2*224*224] = np.reshape(g_frame, 224*224)
     np_arg[2*224*224:3*224*224] = np.reshape(r_frame, 224*224)
 
-    eo.set_frame_index(frame_index)
+    eop.set_frame_index(frame_index)
 
     return True
 
-def process_output(eo, labels_data):
+def process_output(eop, labels_data):
     """Display the inference result using labels."""
 
     # keep top k predictions in heap
@@ -203,7 +243,7 @@ def process_output(eo, labels_data):
     # output predictions with probability of 10/255 or higher
     threshold = 10
 
-    out_buffer = eo.get_output_buffer()
+    out_buffer = eop.get_output_buffer()
     output_array = np.asarray(out_buffer)
 
     k_heap = []
