@@ -179,7 +179,11 @@ def read_frame(eo, frame_index, configuration):
     arg_info = eo.get_input_buffer()
     np_arg = np.asarray(arg_info)
 
-    img = cv2.imread(configuration.in_data)
+    if configuration.in_data.startswith("/dev/"):
+        camera = cv2.VideoCapture(configuration.in_data)
+        _, img = camera.read()
+    else:
+        img = cv2.imread(configuration.in_data)
     resized = cv2.resize(img, (224, 224), interpolation=cv2.INTER_AREA)
     b_frame, g_frame, r_frame = cv2.split(resized)
     np_arg[0*224*224:1*224*224] = np.reshape(b_frame, 224*224)
