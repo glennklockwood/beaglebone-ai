@@ -79,8 +79,8 @@ def main():
 
     EOPS = init_tidl(configuration=CONFIGURATION, pipeline_depth=2)
 
-    with open("imagenet_objects.json", "r", encoding="utf8") as json_file:
-        LABELS = json.load(json_file)
+    with open("imagenet.txt", "r", encoding="utf8") as label_file:
+        LABELS = [x.strip() for x in label_file.readlines()]
 
     try:
         APP.run(host='0.0.0.0')
@@ -229,7 +229,7 @@ def get_classification(eop, labels_data):
     # values of output_array are 8 bits of confidence per label
     output_array = numpy.asarray(eop.get_output_buffer())
     best_label = numpy.argmax(output_array)
-    return (labels_data['objects'][best_label]['label'], 100 * output_array[best_label] / 255)
+    return (labels_data[best_label], 100 * output_array[best_label] / 255)
 
 if __name__ == '__main__':
     main()

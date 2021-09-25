@@ -16,7 +16,7 @@ TIDL_LOCAL_BASE="/usr/share/ti/examples/tidl"
 TIDL_REPO_BASE="https://git.ti.com/cgit/tidl/tidl-api/plain/examples"
 
 rel_path[cat-pet-animal-domestic-104827.jpeg]="test/testvecs/input/objects"
-rel_path[imagenet_objects.json]="mobilenet_subgraph"
+rel_path[imagenet.txt]="classification"
 rel_path[tidl_net_imagenet_jacintonet11v2.bin]="test/testvecs/config/tidl_models"
 rel_path[tidl_param_imagenet_jacintonet11v2.bin]="test/testvecs/config/tidl_models"
 
