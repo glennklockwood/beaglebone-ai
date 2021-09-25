@@ -39,6 +39,7 @@ import logging
 import numpy as np
 import cv2
 import flask
+import subprocess
 
 sys.path.append("/usr/share/ti/tidl/tidl_api")
 import tidl
@@ -57,45 +58,41 @@ APP = flask.Flask(__name__)
 def video_feed():
     global CAMERA, CONFIGURATION
     return flask.Response(
-        stream_camera(
-            camera=CAMERA,
-            num_eve=4,
-            num_dsp=2,
-            configuration=CONFIGURATION),
+        stream_camera(camera=CAMERA, configuration=CONFIGURATION),
         mimetype='multipart/x-mixed-replace; boundary=frame')
 
 def main():
     """Read the configuration and run the network"""
-    global CAMERA, CONFIGURATION
+    global CAMERA, CONFIGURATION, LABELS
 
     logging.basicConfig(level=logging.INFO)
 
+    subprocess.call(['ti-mct-heap-check', '-c'])
 
     CONFIGURATION = tidl.Configuration()
     CONFIGURATION.read_from_file("imagenet.conf")
 
     CAMERA = cv2.VideoCapture("/dev/video1")
 
-    APP.run(host='0.0.0.0')
+    EOPS = init_tidl(configuration=CONFIGURATION, pipeline_depth=2)
 
-def init_tidl(configuration, num_eve, num_dsp, pipeline_depth):
-    global EXECUTORS
-    tot_eve = tidl.Executor.get_num_devices(tidl.DeviceType.EVE)
-    tot_dsp = tidl.Executor.get_num_devices(tidl.DeviceType.DSP)
-    if num_eve < 0 or num_eve > tot_eve:
-        raise ValueError(f"Must use between 0 and {tot_eve:d} EVEs")
-    if num_dsp < 0 or num_dsp > tot_dsp:
-        raise ValueError(f"Must use between 0 and {tot_dsp:d} DSPs")
-    if tot_eve == 0 and tot_dsp == 0:
-        raise RuntimeError('No TIDL API capable devices available')
+    with open('imagenet_objects.json') as json_file:
+        LABELS = json.load(json_file)
+
+    try:
+        APP.run(host='0.0.0.0')
+    except KeyboardInterrupt:
+        free_tidl(EOPS)
+        CAMERA.release()
+
+def init_tidl(configuration, pipeline_depth):
+    global EXECUTORS, EOPS
+
+    num_eve = tidl.Executor.get_num_devices(tidl.DeviceType.EVE)
+    num_dsp = tidl.Executor.get_num_devices(tidl.DeviceType.DSP)
 
     logging.info(
         'Running network across {} EVEs, {} DSPs'.format(num_eve, num_dsp))
-
-    dsp_device_ids = set([tidl.DeviceId.ID0, tidl.DeviceId.ID1,
-                          tidl.DeviceId.ID2, tidl.DeviceId.ID3][0:num_dsp])
-    eve_device_ids = set([tidl.DeviceId.ID0, tidl.DeviceId.ID1,
-                          tidl.DeviceId.ID2, tidl.DeviceId.ID3][0:num_eve])
 
     # Heap sizes for this network determined using Configuration.showHeapStats
     configuration.param_heap_size = (3 << 20)
@@ -105,25 +102,35 @@ def init_tidl(configuration, num_eve, num_dsp, pipeline_depth):
 
     # Collect all EOs from EVE and DSP executors
     eos = []
+    logging.info('TIDL API: finding EVE EOs...')
+    eve_device_ids = set([tidl.DeviceId.ID0, tidl.DeviceId.ID1, tidl.DeviceId.ID2, tidl.DeviceId.ID3][0:num_eve])
     if eve_device_ids:
         EXECUTORS['eve'] = tidl.Executor(tidl.DeviceType.EVE, eve_device_ids, configuration, 1)
         for i in range(EXECUTORS['eve'].get_num_execution_objects()):
             eos.append(EXECUTORS['eve'].at(i))
 
+    logging.info('TIDL API: finding DSP EOs...')
+    dsp_device_ids = set([tidl.DeviceId.ID0, tidl.DeviceId.ID1, tidl.DeviceId.ID2, tidl.DeviceId.ID3][0:num_dsp])
     if dsp_device_ids:
         EXECUTORS['dsp'] = tidl.Executor(tidl.DeviceType.DSP, dsp_device_ids, configuration, 1)
         for i in range(EXECUTORS['dsp'].get_num_execution_objects()):
             eos.append(EXECUTORS['dsp'].at(i))
 
     # initialize ExecutionObjectPipelines
-    eops = []
+    logging.info('TIDL API: initializing EOPs...')
+    EOPS = []
     for j in range(pipeline_depth):
         for i, eo in enumerate(eos):
-            eops.append(tidl.ExecutionObjectPipeline([eo]))
+            EOPS.append(tidl.ExecutionObjectPipeline([eo]))
 
-    tidl.allocate_memory(eops)
+    logging.info('TIDL API: allocating memory for EOPs...')
+    tidl.allocate_memory(EOPS)
 
-    return eops
+    return EOPS
+
+def finalize_tidl():
+    global EOPS
+    tidl.free_memory(EOPS)
 
 def device_name_to_eo(device_name):
     """Translates device name to an ExecutionObject.
@@ -151,41 +158,29 @@ def device_name_to_eo(device_name):
 
     return None
 
-
-def stream_camera(camera, num_eve, num_dsp, configuration, labels_file='imagenet_objects.json' , pipeline_depth=2):
+def stream_camera(camera, configuration):
     """ Run the network on the specified device type and number of devices"""
-    global EOPS
-
-    if not EOPS:
-        EOPS = init_tidl(
-            configuration=configuration,
-            num_eve=num_eve,
-            num_dsp=num_dsp,
-            pipeline_depth=pipeline_depth)
-    eops = EOPS
+    global LABELS
 
     # initialize TIDL, devices, etc
-    num_eops = len(eops)
+    num_eops = len(EOPS)
     frames = [None] * num_eops
-
-    # open labels file
-    with open(labels_file) as json_file:
-        labels_data = json.load(json_file)
 
     # initialize camera
 
     frame_index = 0
     while True:
         frame_index = frame_index % num_eops
-        eop = eops[frame_index]
+        eop = EOPS[frame_index]
 
         # once an EOP becomes available, process its output
         if eop.process_frame_wait():
-            labels = process_output(eop, labels_data)
-            if len(labels) > 0:
+            labels = process_output(eop, LABELS)
+            if len(labels) > 0 and labels[0][1] > 10.0:
+                text = "{} {:.0f}%".format(*labels[0]).replace("_", " ")
                 cv2.putText(
                     img=frames[frame_index],
-                    text="{} {}".format(*labels[0]),
+                    text=text,
                     org=(15, 60),
                     fontFace=cv2.FONT_HERSHEY_SIMPLEX,
                     fontScale=1.0,
@@ -200,7 +195,6 @@ def stream_camera(camera, num_eve, num_dsp, configuration, labels_file='imagenet
         if frames[frame_index] is not None:
             eop.process_frame_start_async()
 
-    tidl.free_memory(eops)
 
 def read_frame(camera, eop, configuration):
     """Read a frame into the ExecutionObject input buffer"""
