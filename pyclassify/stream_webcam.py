@@ -1,31 +1,28 @@
 #!/usr/bin/env python3
+"""Streams video from webcam to http via Flask and OpenCV.
+
+Demonstrates how to connect OpenCV to Flask to stream a webcam using Python.
+Use this as a foundation for doing streaming image processing.
+"""
 
 import flask
 import cv2
-import time
-
-CAMERA = None
 
 app = flask.Flask(__name__)
 
-def gen():
-    global CAMERA
+def stream_camera(camera):
     while True:
-        if not CAMERA:
-            print("initializing camera")
-            CAMERA = cv2.VideoCapture("/dev/video1")
-        ret, frame = CAMERA.read()
+        ret, frame = camera.read()
         if ret:
             _, imstr = cv2.imencode(".jpg", frame)
-            yield (b'--frame\r\n'
-                   b'Content-Type: image/jpeg\r\n\r\n' + bytes(imstr) + b'\r\n')
+            yield (b'--frame\r\nContent-Type: image/jpeg\r\n\r\n'
+                + bytes(imstr) + b'\r\n')
 
 @app.route('/')
 def video_feed():
     return flask.Response(
-        gen(),
+        stream_camera(cv2.VideoCapture("/dev/video1")),
         mimetype='multipart/x-mixed-replace; boundary=frame')
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', debug=True)
-
+    app.run(host='0.0.0.0')
