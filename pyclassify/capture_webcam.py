@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+import io
 import cv2
 
 camera = cv2.VideoCapture("/dev/video1")
