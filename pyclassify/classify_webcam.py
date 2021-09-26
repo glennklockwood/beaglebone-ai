@@ -28,6 +28,7 @@ THE POSSIBILITY OF SUCH DAMAGE.
 """
 
 import sys
+import glob
 import time
 import json
 import logging
@@ -40,19 +41,21 @@ import flask
 sys.path.append("/usr/share/ti/tidl/tidl_api")
 import tidl
 
+# Change these if necessary
+CAMERA_DEVICE = "/dev/video1" # camera device
+FPS_QUEUE_LEN = 10 # calculate fps over this many seconds
+MIN_CONFIDENCE = 25 # don't display labels if confidence is lower than this (%)
+
 # MUST make sure EVE and DSP Executor objects are not garbage collected as
 # they fall out of scope - even though Python doesn't reference them, the TIDL
 # runtime will transparently reference them which will trigger mystery
 # segfaults if Python destroys them
 EXECUTORS = {}
-LABELS = {}
+LABELS = None
 EOPS = None
 CAMERA = None
 CONFIGURATION = None
 APP = flask.Flask(__name__)
-
-FPS_QUEUE_LEN = 10 # calculate fps over this many seconds
-MIN_CONFIDENCE = 25 # don't display labels if confidence is lower than this (%)
 
 @APP.route('/')
 def video_feed():
@@ -75,7 +78,7 @@ def main():
     CONFIGURATION = tidl.Configuration()
     CONFIGURATION.read_from_file("imagenet.conf")
 
-    CAMERA = cv2.VideoCapture("/dev/video1")
+    CAMERA = cv2.VideoCapture(CAMERA_DEVICE)
 
     EOPS = init_tidl(configuration=CONFIGURATION, pipeline_depth=2)
 
@@ -229,6 +232,7 @@ def get_classification(eop, labels_data):
     # values of output_array are 8 bits of confidence per label
     output_array = numpy.asarray(eop.get_output_buffer())
     best_label = numpy.argmax(output_array)
+
     return (labels_data[best_label], 100 * output_array[best_label] / 255)
 
 if __name__ == '__main__':
