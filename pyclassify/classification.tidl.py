@@ -39,6 +39,8 @@ import flask
 sys.path.append("/usr/share/ti/tidl/tidl_api")
 import tidl
 
+CAMERA_DEVICE = "/dev/video1"
+
 # MUST make sure EVE and DSP Executor objects are not garbage collected as
 # they fall out of scope - even though Python doesn't reference them, the TIDL
 # runtime will transparently reference them which will trigger mystery
@@ -51,17 +53,8 @@ EOP_FRAMES = None
 CAMERA = None
 LAST_RPT_ID = None
 CONFIGURATION = None
-APP = flask.Flask(__name__)
-
 SELECTED_ITEMS = None
-
-@APP.route('/')
-def video_feed():
-    """Returns an mjpg stream of classified image frames.
-    """
-    return flask.Response(
-        generate_stream(camera=CAMERA),
-        mimetype='multipart/x-mixed-replace; boundary=frame')
+APP = flask.Flask(__name__)
 
 def filter_init():
     """Initializes the inference process
@@ -105,38 +98,35 @@ def filter_init():
     logging.info("Number of EOPs: %d", NUM_EOPS)
     logging.info("About to start ProcessFrame loop!!")
 
-def main():
-    """Initializes and launches the streaming classification app.
-    """
-    logging.basicConfig(level=logging.INFO)
+def filter_process(camera, frame_index, eop):
+    """Manages work on an ExecutionObjectPipeline.
 
-    logging.info("Cleaning EVE and DSP heaps...")
-    subprocess.call(['ti-mct-heap-check', '-c'])
-
-    global CAMERA
-    CAMERA = cv2.VideoCapture("/dev/video1")
-
-    filter_init()
-
-    logging.info("http://localhost:8080/")
-    try:
-        APP.run(host='0.0.0.0', port=8080)
-    except:
-        tidl.free_memory(EOPS)
-        CAMERA.release()
-        raise
-
-def populate_labels(filename):
-    """Loads ImageNet labels.
-
-    Expects a plain-text file with one label per line and nothing else.
+    Displays the results from a completed EOP and/or loads work on to a free
+    EOP.  Notice that we load a new frame into the EOP (preprocess_image)
+    before we read the output off of it (display_frame); we can do this because
+    EOPs maintain separate input and output buffers.
 
     Args:
-        filename (str): Path to imagenet labels file
+        camera (cv2.VideoCapture): Camera from which a frame should be read
+        frame_index (int): Index of the EOP being managed
+        eop (tidl.ExecutionObjectPipeline): The EOP being managed
+
+    Returns:
+        bytes or None: Part of an mjpg stream if output was read off of the EOP
     """
-    global LABELS_CLASSES
-    with open(filename, "r", encoding="utf8") as ifstream:
-        LABELS_CLASSES = [x.strip() for x in ifstream.readlines()]
+    do_display = False
+    if eop.process_frame_wait():
+        do_display = True
+
+    # this is ProcessFrame in the C++ version
+    EOP_FRAMES[frame_index] = preprocess_image(camera, eop)
+    if EOP_FRAMES[frame_index] is not None:
+        eop.process_frame_start_async()
+
+    if do_display:
+        return display_frame(eop, EOP_FRAMES[frame_index])
+
+    return None
 
 def create_execution_object_pipelines():
     """Initializes TIDL device buffers and memory.
@@ -179,58 +169,6 @@ def allocate_memory():
     create_execution_object_pipelines()
     tidl.allocate_memory(EOPS)
 
-def filter_process(camera, frame_index, eop):
-    """Manages work on an ExecutionObjectPipeline.
-
-    Displays the results from a completed EOP and/or loads work on to a free
-    EOP.  Notice that we load a new frame into the EOP (preprocess_image)
-    before we read the output off of it (display_frame); we can do this because
-    EOPs maintain separate input and output buffers.
-
-    Args:
-        camera (cv2.VideoCapture): Camera from which a frame should be read
-        frame_index (int): Index of the EOP being managed
-        eop (tidl.ExecutionObjectPipeline): The EOP being managed
-
-    Returns:
-        bytes or None: Part of an mjpg stream if output was read off of the EOP
-    """
-    do_display = False
-    if eop.process_frame_wait():
-        do_display = True
-
-    # this is ProcessFrame in the C++ version
-    EOP_FRAMES[frame_index] = preprocess_image(camera, eop)
-    if EOP_FRAMES[frame_index] is not None:
-        eop.process_frame_start_async()
-
-    if do_display:
-        return display_frame(eop, EOP_FRAMES[frame_index])
-
-    return None
-
-def generate_stream(camera):
-    """Generates frames to be displayed via HTTP
-
-    Master loop that reads an image from a camera, runs it through our model,
-    paints the top label on the image, and returns it as a component of an mjpg
-    stream.
-
-    Args:
-        camera (cv2.VideoCapture): Camera from which frames should be read
-
-    Yields:
-        bytes or None: Part of an mjpg stream if output was read off of the EOP
-    """
-    frame_index = 0
-    while True:
-        frame_index = (frame_index + 1) % NUM_EOPS
-        eop = EOPS[frame_index]
-
-        output_frame = filter_process(camera, frame_index, eop)
-        if output_frame is not None:
-            yield output_frame
-
 def display_frame(eop, dst):
     """Reads and labels output from an EOP.
 
@@ -260,6 +198,57 @@ def display_frame(eop, dst):
     _, encoded_frame = cv2.imencode(".jpg", dst)
     return (b'--frame\r\nContent-Type: image/jpeg\r\n\r\n'
         + bytes(encoded_frame) + b'\r\n')
+
+def tf_postprocess(eop):
+    """Retrieves and decodes model output.
+
+    Returns the label and confidence of the most-confident label identified by
+    the model.  This is a vastly simplified version of the C++ example which
+    uses a heap queue to sort the top values but discards all but the top.
+    This also incorporates the C++ tf_expected_id function.
+
+    Args:
+        eop (tidl.ExecutionObjectPipeline): EOP from which label should be read
+
+    Returns:
+        int: Index of LABELS_CLASSES corresponding to highest-confidence
+        classification
+    """
+    top_candidates = 3
+
+    # values of output_array are 8 bits of confidence per label
+    output_array = numpy.asarray(eop.get_output_buffer())
+
+    # initialize priority queue - algorithically inexpensive way of figuring out
+    # the top classifications
+    queue = [(output_array[i], i) for i in range(top_candidates)]
+    heapq.heapify(queue)
+
+    # keep track of the largest three labels
+    for i in range(top_candidates, output_array.size):
+        heapq.heappushpop(queue, (output_array[i], i))
+
+    # reverse sort top labels (largest first)
+    queue.sort(key=lambda x: x[0], reverse=True)
+
+    # iterate largest to smallest and return first match
+    for _, idx in queue:
+        if idx in SELECTED_ITEMS:
+            return idx
+
+    return None
+
+def populate_labels(filename):
+    """Loads ImageNet labels.
+
+    Expects a plain-text file with one label per line and nothing else.
+
+    Args:
+        filename (str): Path to imagenet labels file
+    """
+    global LABELS_CLASSES
+    with open(filename, "r", encoding="utf8") as ifstream:
+        LABELS_CLASSES = [x.strip() for x in ifstream.readlines()]
 
 def preprocess_image(camera, eop):
     """Reads a frame into an ExecutionObject input buffer.
@@ -300,44 +289,61 @@ def preprocess_image(camera, eop):
 
     return frame
 
-def tf_postprocess(eop):
-    """Retrieves and decodes model output.
+def generate_stream(camera):
+    """Generates frames to be displayed via HTTP
 
-    Returns the label and confidence of the most-confident label identified by
-    the model.  This is a vastly simplified version of the C++ example which
-    uses a heap queue to sort the top values but discards all but the top.
-    This also incorporates the C++ tf_expected_id function.
+    Master loop that reads an image from a camera, runs it through our model,
+    paints the top label on the image, and returns it as a component of an mjpg
+    stream.  In the C++ version, this functionality is provided by mjpg-streamer
+    itself.
 
     Args:
-        eop (tidl.ExecutionObjectPipeline): EOP from which label should be read
+        camera (cv2.VideoCapture): Camera from which frames should be read
 
-    Returns:
-        int: Index of LABELS_CLASSES corresponding to highest-confidence
-        classification
+    Yields:
+        bytes or None: Part of an mjpg stream if output was read off of the EOP
     """
-    top_candidates = 3
+    frame_index = 0
+    while True:
+        frame_index = (frame_index + 1) % NUM_EOPS
+        eop = EOPS[frame_index]
 
-    # values of output_array are 8 bits of confidence per label
-    output_array = numpy.asarray(eop.get_output_buffer())
+        output_frame = filter_process(camera, frame_index, eop)
+        if output_frame is not None:
+            yield output_frame
 
-    # initialize priority queue - algorithically inexpensive way of figuring out
-    # the top classifications
-    queue = [(output_array[i], i) for i in range(top_candidates)]
-    heapq.heapify(queue)
+@APP.route('/')
+def video_feed():
+    """Returns an mjpg stream of classified image frames.
 
-    # keep track of the largest three labels
-    for i in range(top_candidates, output_array.size):
-        heapq.heappushpop(queue, (output_array[i], i))
+    In the C++ version, this functionality is provided by mjpg-streamer itself.
+    """
+    return flask.Response(
+        generate_stream(camera=CAMERA),
+        mimetype='multipart/x-mixed-replace; boundary=frame')
 
-    # reverse sort top labels (largest first)
-    queue.sort(key=lambda x: x[0], reverse=True)
+def main():
+    """Initializes and launches the streaming classification app.
 
-    # iterate largest to smallest and return first match
-    for _, idx in queue:
-        if idx in SELECTED_ITEMS:
-            return idx
+    In the C++ version, this functionality is provided by mjpg-streamer itself.
+    """
+    logging.basicConfig(level=logging.INFO)
 
-    return None
+    logging.info("Cleaning EVE and DSP heaps...")
+    subprocess.call(['ti-mct-heap-check', '-c'])
+
+    global CAMERA
+    CAMERA = cv2.VideoCapture(CAMERA_DEVICE)
+
+    filter_init()
+
+    logging.info("http://localhost:8080/")
+    try:
+        APP.run(host='0.0.0.0', port=8080)
+    except:
+        tidl.free_memory(EOPS)
+        CAMERA.release()
+        raise
 
 if __name__ == '__main__':
     main()
