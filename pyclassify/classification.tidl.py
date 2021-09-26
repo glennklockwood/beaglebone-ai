@@ -28,6 +28,7 @@ THE POSSIBILITY OF SUCH DAMAGE.
 """
 
 import sys
+import heapq
 import logging
 import subprocess
 
@@ -319,18 +320,24 @@ def tf_postprocess(eop):
     # values of output_array are 8 bits of confidence per label
     output_array = numpy.asarray(eop.get_output_buffer())
 
-    # initialize priority queue with smallest value at front
-    queue = [(output_array[i], i) for i in range(output_array.size)]
-    queue.sort(key=lambda x: x[0], reverse=True)
-    queue = queue[:TOP_CANDIDATES]
+    # initialize priority queue - algorithically inexpensive way of figuring out
+    # the top classifications
+    queue = [(output_array[i], i) for i in range(TOP_CANDIDATES)]
+    heapq.heapify(queue)
 
-    # iterate smallest to largest, saving the largest matching item
-    rpt_id = None
+    # keep track of the largest three labels
+    for i in range(TOP_CANDIDATES, output_array.size):
+        heapq.heappushpop(queue, (output_array[i], i))
+
+    # reverse sort top labels (largest first)
+    queue.sort(key=lambda x: x[0], reverse=True)
+
+    # iterate largest to smallest and return first match
     for _, idx in queue:
         if idx in SELECTED_ITEMS:
-            rpt_id = idx
+            return idx
 
-    return rpt_id
+    return None
 
 if __name__ == '__main__':
     main()
