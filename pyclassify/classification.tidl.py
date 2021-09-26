@@ -53,8 +53,6 @@ CONFIGURATION = None
 APP = flask.Flask(__name__)
 
 SELECTED_ITEMS = None
-FPS_QUEUE_LEN = 10 # calculate fps over this many seconds
-MIN_CONFIDENCE = 25 # don't display labels if confidence is lower than this (%)
 
 @APP.route('/')
 def video_feed():
@@ -243,20 +241,22 @@ def display_frame(eop, dst):
         bytes or None: Part of an mjpg stream if output was read off of the EO
     """
     is_object = tf_postprocess(eop)
-    cv2.putText(
-        img=dst,
-        text=LABELS_CLASSES[is_object],
-        org=(15, 60),
-        fontFace=cv2.FONT_HERSHEY_SIMPLEX,
-        fontScale=1.5,
-        color=(0, 255, 0),
-        thickness=3)
-    _, encoded_frame = cv2.imencode(".jpg", dst)
+    if is_object is not None:
+        cv2.putText(
+            img=dst,
+            text=LABELS_CLASSES[is_object],
+            org=(15, 60),
+            fontFace=cv2.FONT_HERSHEY_SIMPLEX,
+            fontScale=1.5,
+            color=(0, 255, 0),
+            thickness=3)
 
-    global LAST_RPT_ID
-    if LAST_RPT_ID != is_object:
-        logging.info("(%d)=%s", is_object, LABELS_CLASSES[is_object])
-        LAST_RPT_ID = is_object
+        global LAST_RPT_ID
+        if LAST_RPT_ID != is_object:
+            logging.info("(%d)=%s", is_object, LABELS_CLASSES[is_object])
+            LAST_RPT_ID = is_object
+
+    _, encoded_frame = cv2.imencode(".jpg", dst)
     return (b'--frame\r\nContent-Type: image/jpeg\r\n\r\n'
         + bytes(encoded_frame) + b'\r\n')
 
@@ -314,18 +314,21 @@ def tf_postprocess(eop):
         int: Index of LABELS_CLASSES corresponding to highest-confidence
         classification
     """
+    TOP_CANDIDATES = 3
+
     # values of output_array are 8 bits of confidence per label
     output_array = numpy.asarray(eop.get_output_buffer())
 
-    # more efficient if you don't care about SELECTED_ITEMS
-    #top_candidate = numpy.argmax(output_array)
+    # initialize priority queue with smallest value at front
+    queue = [(output_array[i], i) for i in range(output_array.size)]
+    queue.sort(key=lambda x: x[0], reverse=True)
+    queue = queue[:TOP_CANDIDATES]
 
+    # iterate smallest to largest, saving the largest matching item
     rpt_id = None
-    top_val = None
-    for idx in SELECTED_ITEMS:
-        if top_val is None or output_array[idx] > top_val:
+    for _, idx in queue:
+        if idx in SELECTED_ITEMS:
             rpt_id = idx
-            top_val = output_array[idx]
 
     return rpt_id
 
