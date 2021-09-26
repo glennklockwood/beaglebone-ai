@@ -315,18 +315,18 @@ def tf_postprocess(eop):
         int: Index of LABELS_CLASSES corresponding to highest-confidence
         classification
     """
-    TOP_CANDIDATES = 3
+    top_candidates = 3
 
     # values of output_array are 8 bits of confidence per label
     output_array = numpy.asarray(eop.get_output_buffer())
 
     # initialize priority queue - algorithically inexpensive way of figuring out
     # the top classifications
-    queue = [(output_array[i], i) for i in range(TOP_CANDIDATES)]
+    queue = [(output_array[i], i) for i in range(top_candidates)]
     heapq.heapify(queue)
 
     # keep track of the largest three labels
-    for i in range(TOP_CANDIDATES, output_array.size):
+    for i in range(top_candidates, output_array.size):
         heapq.heappushpop(queue, (output_array[i], i))
 
     # reverse sort top labels (largest first)
