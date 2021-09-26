@@ -6,13 +6,13 @@ All rights reserved.
 Redistribution and use in source and binary forms, with or without
 modification, are permitted provided that the following conditions are met:
 * Redistributions of source code must retain the above copyright
-notice, this list of conditions and the following disclaimer.
+  notice, this list of conditions and the following disclaimer.
 * Redistributions in binary form must reproduce the above copyright
-notice, this list of conditions and the following disclaimer in the
-documentation and/or other materials provided with the distribution.
+  notice, this list of conditions and the following disclaimer in the
+  documentation and/or other materials provided with the distribution.
 * Neither the name of Texas Instruments Incorporated nor the
-names of its contributors may be used to endorse or promote products
-derived from this software without specific prior written permission.
+  names of its contributors may be used to endorse or promote products
+  derived from this software without specific prior written permission.
 
 THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
 AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
@@ -65,12 +65,13 @@ def video_feed():
         mimetype='multipart/x-mixed-replace; boundary=frame')
 
 def filter_init():
-    global SELECTED_ITEMS, CONFIGURATION, NUM_EOPS, EOP_FRAMES
-
+    """Initializes the inference process
+    """
     logging.info("Initializing application")
 
     populate_labels("/usr/share/ti/examples/tidl/classification/imagenet.txt")
 
+    global SELECTED_ITEMS
     SELECTED_ITEMS = [
         429, # baseball
         837, # sunglasses
@@ -85,6 +86,7 @@ def filter_init():
     ]
 
     logging.info("Loading configuration")
+    global CONFIGURATION
     CONFIGURATION = tidl.Configuration()
     CONFIGURATION.in_data= "/usr/share/ti/examples/tidl/test/testvecs/input/preproc_0_224x224.y"
     CONFIGURATION.network_heap_size = (20 << 20)
@@ -97,6 +99,8 @@ def filter_init():
 
     logging.info("Allocating I/O memory for each EOP")
     allocate_memory()
+
+    global NUM_EOPS, EOP_FRAMES
     NUM_EOPS = len(EOPS)
     EOP_FRAMES = [None] * NUM_EOPS
     logging.info("Number of EOPs: %d", NUM_EOPS)
@@ -105,13 +109,12 @@ def filter_init():
 def main():
     """Initializes and launches the streaming classification app.
     """
-    global CAMERA
-
     logging.basicConfig(level=logging.INFO)
 
     logging.info("Cleaning EVE and DSP heaps...")
     subprocess.call(['ti-mct-heap-check', '-c'])
 
+    global CAMERA
     CAMERA = cv2.VideoCapture("/dev/video1")
 
     filter_init()
@@ -125,6 +128,13 @@ def main():
         raise
 
 def populate_labels(filename):
+    """Loads ImageNet labels.
+
+    Expects a plain-text file with one label per line and nothing else.
+
+    Args:
+        filename (str): Path to imagenet labels file
+    """
     global LABELS_CLASSES
     with open(filename, "r", encoding="utf8") as ifstream:
         LABELS_CLASSES = [x.strip() for x in ifstream.readlines()]
@@ -136,8 +146,6 @@ def create_execution_object_pipelines():
     resources to process video frames using all of them.  Note the C++ example
     hard-codes the number of EVEs and DSPs, but we query for all of them here.
     """
-    global EOPS
-
     num_eve = tidl.Executor.get_num_devices(tidl.DeviceType.EVE)
     num_dsp = tidl.Executor.get_num_devices(tidl.DeviceType.DSP)
     buffer_factor = 1
@@ -160,17 +168,33 @@ def create_execution_object_pipelines():
             eos.append(EXECUTORS['dsp'].at(i))
 
     # initialize ExecutionObjectPipelines
+    global EOPS
     EOPS = []
     for _ in range(buffer_factor):
         for i, execobj in enumerate(eos):
             EOPS.append(tidl.ExecutionObjectPipeline([execobj]))
 
 def allocate_memory():
+    """Allocates memory through the TIDL API
+    """
     create_execution_object_pipelines()
     tidl.allocate_memory(EOPS)
 
 def filter_process(camera, frame_index, eop):
-    """Classifies image from a webcam, labels them, and yields them.
+    """Manages work on an ExecutionObjectPipeline.
+
+    Displays the results from a completed EOP and/or loads work on to a free
+    EOP.  Notice that we load a new frame into the EOP (preprocess_image)
+    before we read the output off of it (display_frame); we can do this because
+    EOPs maintain separate input and output buffers.
+
+    Args:
+        camera (cv2.VideoCapture): Camera from which a frame should be read
+        frame_index (int): Index of the EOP being managed
+        eop (tidl.ExecutionObjectPipeline): The EOP being managed
+
+    Returns:
+        bytes or None: Part of an mjpg stream if output was read off of the EOP
     """
     do_display = False
     if eop.process_frame_wait():
@@ -192,18 +216,32 @@ def generate_stream(camera):
     Master loop that reads an image from a camera, runs it through our model,
     paints the top label on the image, and returns it as a component of an mjpg
     stream.
+
+    Args:
+        camera (cv2.VideoCapture): Camera from which frames should be read
+
+    Yields:
+        bytes or None: Part of an mjpg stream if output was read off of the EOP
     """
     frame_index = 0
     while True:
         frame_index = (frame_index + 1) % NUM_EOPS
         eop = EOPS[frame_index]
 
-        do_display = filter_process(camera, frame_index, eop)
-        if do_display is not None:
-            yield do_display
+        output_frame = filter_process(camera, frame_index, eop)
+        if output_frame is not None:
+            yield output_frame
 
 def display_frame(eop, dst):
-    global LAST_RPT_ID
+    """Reads and labels output from an EOP.
+
+    Args:
+        eop (tidl.ExecutionObjectPipeline): The EOP containing output
+        dst (numpy.array): Original image that was loaded on to the EOP
+
+    Returns:
+        bytes or None: Part of an mjpg stream if output was read off of the EO
+    """
     is_object = tf_postprocess(eop)
     cv2.putText(
         img=dst,
@@ -214,6 +252,8 @@ def display_frame(eop, dst):
         color=(0, 255, 0),
         thickness=3)
     _, encoded_frame = cv2.imencode(".jpg", dst)
+
+    global LAST_RPT_ID
     if LAST_RPT_ID != is_object:
         logging.info("(%d)=%s", is_object, LABELS_CLASSES[is_object])
         LAST_RPT_ID = is_object
@@ -230,25 +270,32 @@ def preprocess_image(camera, eop):
 
     https://software-dl.ti.com/jacinto7/esd/processor-sdk-rtos-jacinto7/06_02_00_21/exports/docs/tidl_j7_01_01_00_10/ti_dl/docs/user_guide_html/md_tidl_fsg_io_tensors_format.html
 
+    Args:
+        camera (cv2.VideoCapture): Camera from which a frame should be read
+        eop (tidl.ExecutionObjectPipeline): EOP to which frame will be loaded
+
     Returns:
-        numpy.array: Unmodified frame retrieved from webcam.
+        numpy.array: Unmodified frame retrieved from camera.
     """
+    width = CONFIGURATION.width
+    height = CONFIGURATION.height
+    size = width * height
 
     success, frame = camera.read()
     if not success:
         return None
 
     # resize the frame to fit our TIDL input buffer
-    resized = cv2.resize(frame, (224, 224), interpolation=cv2.INTER_AREA)
+    resized = cv2.resize(frame, (width, height), interpolation=cv2.INTER_AREA)
 
     # split out the channels because of the way TIDL expects images
     b_frame, g_frame, r_frame = cv2.split(resized)
 
     # np_arg becomes a pointer to a buffer that looks like a numpy array
     np_arg = numpy.asarray(eop.get_input_buffer())
-    np_arg[0*224*224:1*224*224] = numpy.reshape(b_frame, 224*224)
-    np_arg[1*224*224:2*224*224] = numpy.reshape(g_frame, 224*224)
-    np_arg[2*224*224:3*224*224] = numpy.reshape(r_frame, 224*224)
+    np_arg[0 * size:1 * size] = numpy.reshape(b_frame, size)
+    np_arg[1 * size:2 * size] = numpy.reshape(g_frame, size)
+    np_arg[2 * size:3 * size] = numpy.reshape(r_frame, size)
 
     return frame
 
@@ -258,14 +305,29 @@ def tf_postprocess(eop):
     Returns the label and confidence of the most-confident label identified by
     the model.  This is a vastly simplified version of the C++ example which
     uses a heap queue to sort the top values but discards all but the top.
+    This also incorporates the C++ tf_expected_id function.
+
+    Args:
+        eop (tidl.ExecutionObjectPipeline): EOP from which label should be read
 
     Returns:
-        tuple of str, float: label and confidence expressed between 0 and 100.
+        int: Index of LABELS_CLASSES corresponding to highest-confidence
+        classification
     """
     # values of output_array are 8 bits of confidence per label
     output_array = numpy.asarray(eop.get_output_buffer())
-    best_label = numpy.argmax(output_array)
-    return best_label
+
+    # more efficient if you don't care about SELECTED_ITEMS
+    #top_candidate = numpy.argmax(output_array)
+
+    rpt_id = None
+    top_val = None
+    for idx in SELECTED_ITEMS:
+        if top_val is None or output_array[idx] > top_val:
+            rpt_id = idx
+            top_val = output_array[idx]
+
+    return rpt_id
 
 if __name__ == '__main__':
     main()
