@@ -19,6 +19,10 @@ view with an overlay of whatever the top classification from ImageNet as long as
 the confidence is above 25%.  In your terminal, you should see the frame rate
 of classification printed out every ten seconds or so.
 
+If you get some kind of camera device error, you may need to edit the Python
+script and set the `CAMERA_DEVICE` variable to point to whichever video device
+corresponds to your webcam.
+
 ## Core code
 
 - `classify_webcam.py` - my implementation of the BeagleBone AI classification
